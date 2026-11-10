@@ -4,7 +4,10 @@ The server never stores videos: it asks yt-dlp for the video's direct MP4 URL,
 then streams the bytes straight through to the visitor's browser.
 """
 import asyncio
+import json
+import logging
 import re
+from html import unescape
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -22,6 +25,9 @@ ALLOWED_CDN_SUFFIX = ".fbcdn.net"
 CACHE_TTL = 15 * 60          # seconds an extracted result stays cached
 RATE_LIMIT = 20              # requests per IP ...
 RATE_WINDOW = 10 * 60        # ... per 10 minutes
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("savereel")
 
 app = FastAPI(title="SaveReel", docs_url=None, redoc_url=None)
 STATIC = Path(__file__).parent / "static"
@@ -58,8 +64,73 @@ def normalise_url(raw: str) -> str:
     return raw
 
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _json_str(raw: str) -> str:
+    return json.loads('"' + raw + '"')
+
+
+def _fallback_extract(url: str) -> dict:
+    """Read the MP4 links Facebook embeds in the page itself (what its own player uses)."""
+    with httpx.Client(headers=BROWSER_HEADERS, follow_redirects=True, timeout=20) as c:
+        html = c.get(url).text
+    found = {}
+    for key, label, height in (("browser_native_hd_url", "HD", 720),
+                               ("playable_url_quality_hd", "HD", 720),
+                               ("browser_native_sd_url", "SD", 360),
+                               ("playable_url", "SD", 360)):
+        m = re.search(r'"%s":"(.*?)"' % key, html)
+        if m and label not in found:
+            u = _json_str(m.group(1))
+            if (urlparse(u).hostname or "").lower().endswith(ALLOWED_CDN_SUFFIX):
+                found[label] = {"id": label.lower(), "label": label, "height": height,
+                                "size": None, "_url": u}
+    if not found:
+        login_wall = 'id="login_form"' in html or "/login/" in html[:20000]
+        raise ValueError("fallback: " + ("login wall" if login_wall else "no video urls in page")
+                         + f" (html {len(html)} bytes)")
+
+    def meta(prop):
+        m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % prop, html)
+        return unescape(m.group(1)) if m else None
+
+    dur = re.search(r'"playable_duration_in_ms":(\d+)', html)
+    return {
+        "title": meta("og:title") or "Facebook video",
+        "uploader": None,
+        "thumbnail": meta("og:image"),
+        "duration": int(dur.group(1)) / 1000 if dur else None,
+        "formats": sorted(found.values(), key=lambda f: f["height"], reverse=True),
+    }
+
+
 def _extract(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    try:
+        return _ytdlp_extract(url)
+    except Exception as e:
+        log.warning("yt-dlp failed for %s: %s", url, e)
+        try:
+            return _fallback_extract(url)
+        except Exception as e2:
+            log.warning("fallback failed for %s: %s", url, e2)
+            raise RuntimeError(f"yt-dlp: {e} | {e2}") from e2
+
+
+def _ytdlp_extract(url: str) -> dict:
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+            "http_headers": {"User-Agent": BROWSER_HEADERS["User-Agent"],
+                             "Accept-Language": BROWSER_HEADERS["Accept-Language"]}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist" and info.get("entries"):
@@ -106,8 +177,11 @@ async def extract(url: str) -> dict:
         data = await asyncio.to_thread(_extract, url)
     except Exception as e:  # yt-dlp raises many types
         msg = str(e).lower()
-        if "login" in msg or "private" in msg or "not available" in msg:
-            raise HTTPException(422, "This video is private or needs a login, so it can't be downloaded.")
+        log.error("extract failed: %s", e)
+        if "login wall" in msg:
+            raise HTTPException(422, "Facebook asked our server to log in, so this video can't be fetched right now. Try again in a while.")
+        if "private" in msg or "not available" in msg:
+            raise HTTPException(422, "This video is private or unavailable, so it can't be downloaded.")
         raise HTTPException(422, "Couldn't read that video. Check the link is a public Facebook video or reel.")
     _cache[url] = (time.time(), data)
     if len(_cache) > 500:  # simple size cap
