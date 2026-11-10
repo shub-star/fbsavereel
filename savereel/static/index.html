@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SaveReel — Facebook video &amp; reel downloader</title>
+<meta name="description" content="Paste a public Facebook video or reel link and download it as MP4. Free, no sign-up.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23111'/><path d='M16 8v12m0 0l-5-5m5 5l5-5M9 24h14' stroke='%23d4ff3a' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<style>
+  :root{--bg:#0d0d0f;--card:#17171b;--line:#2a2a31;--text:#f2f2f4;--muted:#9a9aa5;--accent:#d4ff3a;--err:#ff6b6b}
+  *{box-sizing:border-box;margin:0}
+  body{font:16px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
+  main{flex:1;width:100%;max-width:680px;margin:0 auto;padding:72px 20px 40px}
+  .logo{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em;font-size:18px;margin-bottom:48px}
+  .logo i{width:28px;height:28px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#111;font-style:normal;font-size:16px}
+  h1{font-size:clamp(32px,6vw,48px);line-height:1.05;letter-spacing:-.035em;margin-bottom:14px}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--muted);margin-bottom:32px;max-width:48ch}
+  form{display:flex;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:6px}
+  form:focus-within{border-color:#4a4a55}
+  input{flex:1;min-width:0;background:none;border:0;color:var(--text);font:inherit;padding:12px 12px;outline:none}
+  input::placeholder{color:#62626c}
+  button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:12px 20px;cursor:pointer;background:var(--accent);color:#111;transition:transform .1s,opacity .2s}
+  button:active{transform:scale(.97)}
+  button:disabled{opacity:.5;cursor:wait}
+  .msg{margin-top:14px;font-size:14px;color:var(--muted);min-height:21px}
+  .msg.err{color:var(--err)}
+  .result{display:none;margin-top:24px;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .result.show{display:grid;grid-template-columns:160px 1fr}
+  .thumb{background:#000 center/cover no-repeat;min-height:160px}
+  .meta{padding:18px 20px;display:flex;flex-direction:column;gap:6px;min-width:0}
+  .title{font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .small{font-size:13px;color:var(--muted)}
+  .opts{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+  .opts a{display:inline-flex;gap:6px;align-items:center;text-decoration:none;font-size:14px;font-weight:600;padding:9px 14px;border-radius:9px;border:1px solid var(--line);color:var(--text)}
+  .opts a:first-child{background:var(--accent);color:#111;border-color:var(--accent)}
+  .opts a span{font-weight:400;opacity:.7}
+  .how{margin-top:56px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .how div{border-top:1px solid var(--line);padding-top:12px;font-size:14px;color:var(--muted)}
+  .how b{display:block;color:var(--text);font-size:13px;margin-bottom:2px}
+  footer{max-width:680px;margin:0 auto;padding:24px 20px 32px;font-size:12px;color:#6c6c76}
+  @media (max-width:560px){.result.show{grid-template-columns:1fr}.thumb{min-height:180px}.how{grid-template-columns:1fr}form{flex-direction:column}}
+</style>
+</head>
+<body>
+<main>
+  <div class="logo"><i>↓</i>SaveReel</div>
+  <h1>Download Facebook <span>videos &amp; reels.</span></h1>
+  <p class="sub">Paste a link to any public Facebook video or reel. Get an MP4 in seconds — no sign-up, no watermark.</p>
+
+  <form id="f">
+    <input id="u" type="url" inputmode="url" autocomplete="off" placeholder="https://www.facebook.com/reel/…" required>
+    <button id="b" type="submit">Get video</button>
+  </form>
+  <p class="msg" id="m"></p>
+
+  <section class="result" id="r">
+    <div class="thumb" id="t"></div>
+    <div class="meta">
+      <div class="title" id="ti"></div>
+      <div class="small" id="sm"></div>
+      <div class="opts" id="o"></div>
+    </div>
+  </section>
+
+  <div class="how">
+    <div><b>1. Copy</b>Tap Share → Copy link on the Facebook video.</div>
+    <div><b>2. Paste</b>Drop the link in the box above.</div>
+    <div><b>3. Save</b>Pick a quality and the MP4 downloads.</div>
+  </div>
+</main>
+<footer>
+  Works with public videos only. Only download videos you own or have permission to use, and respect creators' rights and Facebook's terms. SaveReel isn't affiliated with Meta and doesn't store any videos.
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmtTime = s => { if(!s) return ""; s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor(s%3600/60), x=String(s%60).padStart(2,"0"); return h?`${h}:${String(m).padStart(2,"0")}:${x}`:`${m}:${x}`; };
+const fmtSize = b => !b ? "" : b>1e9 ? (b/1e9).toFixed(1)+" GB" : (b/1e6).toFixed(0)+" MB";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+$("f").addEventListener("submit", async e => {
+  e.preventDefault();
+  const url = $("u").value.trim();
+  $("r").classList.remove("show");
+  $("m").className = "msg"; $("m").textContent = "Fetching video details…";
+  $("b").disabled = true;
+  try {
+    const res = await fetch("/api/info", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url})});
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || "Something went wrong.");
+    $("t").style.backgroundImage = d.thumbnail ? `url("${d.thumbnail.replace(/"/g,"%22")}")` : "";
+    $("ti").textContent = d.title;
+    $("sm").textContent = [d.uploader, fmtTime(d.duration)].filter(Boolean).join(" · ");
+    $("o").innerHTML = d.formats.map(f =>
+      `<a href="/api/download?url=${encodeURIComponent(d.url)}&format_id=${encodeURIComponent(f.id)}" download>↓ ${esc(f.label)}${f.size?` <span>${fmtSize(f.size)}</span>`:""}</a>`
+    ).join("");
+    $("r").classList.add("show");
+    $("m").textContent = "";
+  } catch (err) {
+    $("m").className = "msg err"; $("m").textContent = err.message;
+  } finally { $("b").disabled = false; }
+});
+</script>
+</body>
+</html>
