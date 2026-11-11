@@ -1,13 +1,15 @@
 """SaveReel — paste a public Facebook video/reel link, get a downloadable MP4.
 
-The server never stores videos: it asks yt-dlp for the video's direct MP4 URL,
-then streams the bytes straight through to the visitor's browser.
+How a link is resolved (first one that works wins):
+  1. yt-dlp            — fast, no browser needed, but its Facebook support breaks often.
+  2. headless Chrome   — opens the page like a real visitor, lets Facebook's own player
+                          load the video, and reads the MP4 links the player receives.
+The server never stores videos: it streams the MP4 straight through to the visitor.
 """
 import asyncio
 import json
 import logging
 import re
-from html import unescape
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -25,6 +27,9 @@ ALLOWED_CDN_SUFFIX = ".fbcdn.net"
 CACHE_TTL = 15 * 60          # seconds an extracted result stays cached
 RATE_LIMIT = 20              # requests per IP ...
 RATE_WINDOW = 10 * 60        # ... per 10 minutes
+BROWSER_TIMEOUT = 25         # seconds to wait for Facebook's player to load the video
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("savereel")
@@ -64,127 +69,186 @@ def normalise_url(raw: str) -> str:
     return raw
 
 
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
+def is_cdn(u: str) -> bool:
+    return (urlparse(u).hostname or "").lower().endswith(ALLOWED_CDN_SUFFIX)
 
 
-def _json_str(raw: str) -> str:
-    return json.loads('"' + raw + '"')
-
-
-def _fallback_extract(url: str) -> dict:
-    """Read the MP4 links Facebook embeds in the page itself (what its own player uses)."""
-    with httpx.Client(headers=BROWSER_HEADERS, follow_redirects=True, timeout=20) as c:
-        html = c.get(url).text
-    found = {}
-    for key, label, height in (("browser_native_hd_url", "HD", 720),
-                               ("playable_url_quality_hd", "HD", 720),
-                               ("browser_native_sd_url", "SD", 360),
-                               ("playable_url", "SD", 360)):
-        m = re.search(r'"%s":"(.*?)"' % key, html)
-        if m and label not in found:
-            u = _json_str(m.group(1))
-            if (urlparse(u).hostname or "").lower().endswith(ALLOWED_CDN_SUFFIX):
-                found[label] = {"id": label.lower(), "label": label, "height": height,
-                                "size": None, "_url": u}
-    if not found:
-        login_wall = 'id="login_form"' in html or "/login/" in html[:20000]
-        raise ValueError("fallback: " + ("login wall" if login_wall else "no video urls in page")
-                         + f" (html {len(html)} bytes)")
-
-    def meta(prop):
-        m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % prop, html)
-        return unescape(m.group(1)) if m else None
-
-    dur = re.search(r'"playable_duration_in_ms":(\d+)', html)
-    return {
-        "title": meta("og:title") or "Facebook video",
-        "uploader": None,
-        "thumbnail": meta("og:image"),
-        "duration": int(dur.group(1)) / 1000 if dur else None,
-        "formats": sorted(found.values(), key=lambda f: f["height"], reverse=True),
-    }
-
-
-def _extract(url: str) -> dict:
-    try:
-        return _ytdlp_extract(url)
-    except Exception as e:
-        log.warning("yt-dlp failed for %s: %s", url, e)
-        try:
-            return _fallback_extract(url)
-        except Exception as e2:
-            log.warning("fallback failed for %s: %s", url, e2)
-            raise RuntimeError(f"yt-dlp: {e} | {e2}") from e2
-
-
+# ---------- method 1: yt-dlp ----------
 def _ytdlp_extract(url: str) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "http_headers": {"User-Agent": BROWSER_HEADERS["User-Agent"],
-                             "Accept-Language": BROWSER_HEADERS["Accept-Language"]}}
+            "http_headers": {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist" and info.get("entries"):
         info = next(e for e in info["entries"] if e)
 
-    # Keep only single-file MP4s that already contain both video and audio,
-    # so no server-side merging (ffmpeg) is needed.
+    # Keep single-file MP4s that already contain video+audio (no ffmpeg merging needed).
     formats = []
     for f in info.get("formats") or []:
         u = f.get("url") or ""
-        host = (urlparse(u).hostname or "").lower()
-        if not host.endswith(ALLOWED_CDN_SUFFIX):
-            continue
-        if f.get("vcodec") == "none" or f.get("acodec") == "none":
+        if not is_cdn(u) or f.get("vcodec") == "none" or f.get("acodec") == "none":
             continue
         if f.get("protocol") not in (None, "https", "http"):
             continue
         h = f.get("height")
-        label = f"{h}p" if h else (f.get("format_note") or f.get("format_id", "")).upper()
-        formats.append({
-            "id": f["format_id"],
-            "label": label,
-            "height": h or 0,
-            "size": f.get("filesize") or f.get("filesize_approx"),
-            "_url": u,
-        })
+        formats.append({"id": f["format_id"],
+                        "label": f"{h}p" if h else (f.get("format_note") or f["format_id"]).upper(),
+                        "height": h or 0,
+                        "size": f.get("filesize") or f.get("filesize_approx"),
+                        "_url": u})
     formats.sort(key=lambda f: f["height"], reverse=True)
     if not formats:
         raise ValueError("no downloadable formats")
-    return {
-        "title": info.get("title") or "Facebook video",
-        "uploader": info.get("uploader"),
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "formats": formats,
-    }
+    return {"title": info.get("title") or "Facebook video", "uploader": info.get("uploader"),
+            "thumbnail": info.get("thumbnail"), "duration": info.get("duration"),
+            "formats": formats}
 
 
+# ---------- method 2: headless Chrome ----------
+_pw = None
+_browser = None
+_browser_lock = asyncio.Lock()
+_browser_slots = asyncio.Semaphore(1)   # one page at a time keeps memory low on small servers
+
+# Keys Facebook's player data uses for progressive (video+audio) MP4 links.
+VIDEO_KEYS = (("browser_native_hd_url", "HD", 720), ("playable_url_quality_hd", "HD", 720),
+              ("browser_native_sd_url", "SD", 360), ("playable_url", "SD", 360))
+
+
+async def get_browser():
+    global _pw, _browser
+    async with _browser_lock:
+        if _browser is None or not _browser.is_connected():
+            from playwright.async_api import async_playwright
+            if _pw is None:
+                _pw = await async_playwright().start()
+            _browser = await _pw.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox",
+                      "--disable-extensions", "--mute-audio"])
+            log.info("headless browser started")
+        return _browser
+
+
+def parse_player_data(text: str) -> dict:
+    """Pull the MP4 links out of page HTML / GraphQL JSON (escaped or not)."""
+    found = {}
+    for key, label, height in VIDEO_KEYS:
+        if label in found:
+            continue
+        # Works whether the JSON is plain or nested/escaped one or more levels deep.
+        m = re.search(r'%s\\*"\s*:\s*\\*"(https?:.*?)\\*"' % key, text)
+        if not m:
+            continue
+        u = m.group(1)
+        for _ in range(4):  # peel off escaping levels
+            u = u.replace("\\\\", "\\").replace("\\/", "/")
+        u = re.sub(r"\\u([0-9a-fA-F]{4})", lambda x: chr(int(x.group(1), 16)), u)
+        u = u.replace("&amp;", "&")
+        if u.startswith("http") and is_cdn(u):
+            found[label] = {"id": label.lower(), "label": label, "height": height,
+                            "size": None, "_url": u}
+    return found
+
+
+async def browser_extract(url: str) -> dict:
+    browser = await get_browser()
+    async with _browser_slots:
+        ctx = await browser.new_context(user_agent=USER_AGENT, locale="en-US",
+                                        viewport={"width": 1280, "height": 800})
+        captured: list[str] = []
+        try:
+            page = await ctx.new_page()
+
+            # Save bandwidth/memory: skip images, fonts and the actual video stream.
+            async def block(route):
+                if route.request.resource_type in ("image", "media", "font"):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", block)
+
+            # Facebook's player fetches the video links via /api/graphql/ after load.
+            async def on_response(resp):
+                if "/api/graphql" in resp.url:
+                    try:
+                        body = await resp.text()
+                        if "browser_native" in body or "playable_url" in body:
+                            captured.append(body)
+                    except Exception:
+                        pass
+            page.on("response", on_response)
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT * 1000)
+
+            found, deadline = {}, time.time() + BROWSER_TIMEOUT
+            while time.time() < deadline:
+                html = await page.content()
+                found = parse_player_data(html + "\n".join(captured))
+                if "HD" in found or ("SD" in found and time.time() > deadline - BROWSER_TIMEOUT / 2):
+                    break
+                await asyncio.sleep(1)
+
+            if not found:
+                html = await page.content()
+                if 'id="login_form"' in html and "browser_native" not in html:
+                    raise ValueError("browser: login wall")
+                raise ValueError("browser: player never loaded a video link")
+
+            meta = await page.evaluate("""() => {
+                const m = p => document.querySelector(`meta[property="${p}"]`)?.content || null;
+                const v = document.querySelector('video');
+                return {title: m('og:title') || document.title, image: m('og:image'),
+                        duration: v && isFinite(v.duration) ? v.duration : null};
+            }""")
+            dur = re.search(r'"playable_duration_in_ms":(\d+)', await page.content())
+            return {"title": (meta.get("title") or "Facebook video").strip(),
+                    "uploader": None,
+                    "thumbnail": meta.get("image"),
+                    "duration": int(dur.group(1)) / 1000 if dur else meta.get("duration"),
+                    "formats": sorted(found.values(), key=lambda f: f["height"], reverse=True)}
+        finally:
+            await ctx.close()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _browser:
+        await _browser.close()
+    if _pw:
+        await _pw.stop()
+
+
+# ---------- combined ----------
 async def extract(url: str) -> dict:
     hit = _cache.get(url)
     if hit and time.time() - hit[0] < CACHE_TTL:
         return hit[1]
+    errors = []
+    data = None
     try:
-        data = await asyncio.to_thread(_extract, url)
-    except Exception as e:  # yt-dlp raises many types
-        msg = str(e).lower()
-        log.error("extract failed: %s", e)
+        data = await asyncio.to_thread(_ytdlp_extract, url)
+        log.info("yt-dlp ok for %s", url)
+    except Exception as e:
+        errors.append(f"yt-dlp: {e}")
+        log.warning("yt-dlp failed for %s: %s", url, e)
+        try:
+            data = await asyncio.wait_for(browser_extract(url), BROWSER_TIMEOUT + 20)
+            log.info("browser ok for %s", url)
+        except Exception as e2:
+            errors.append(f"browser: {e2!r}")
+            log.error("extract failed for %s: %s", url, " | ".join(errors))
+
+    if data is None:
+        msg = " ".join(errors).lower()
         if "login wall" in msg:
             raise HTTPException(422, "Facebook asked our server to log in, so this video can't be fetched right now. Try again in a while.")
         if "private" in msg or "not available" in msg:
             raise HTTPException(422, "This video is private or unavailable, so it can't be downloaded.")
         raise HTTPException(422, "Couldn't read that video. Check the link is a public Facebook video or reel.")
+
     _cache[url] = (time.time(), data)
-    if len(_cache) > 500:  # simple size cap
+    if len(_cache) > 500:
         for k in sorted(_cache, key=lambda k: _cache[k][0])[:100]:
             _cache.pop(k, None)
     return data
@@ -230,16 +294,18 @@ async def download(url: str, format_id: str, request: Request):
     if not fmt:
         raise HTTPException(404, "That quality isn't available any more. Reload and try again.")
 
-    # Only ever proxy URLs that yt-dlp returned and that live on Facebook's CDN (no SSRF).
+    # Only ever proxy URLs we extracted ourselves that live on Facebook's CDN (no SSRF).
     cdn_url = fmt["_url"]
-    if not (urlparse(cdn_url).hostname or "").lower().endswith(ALLOWED_CDN_SUFFIX):
+    if not is_cdn(cdn_url):
         raise HTTPException(400, "Unexpected video source.")
 
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=120), follow_redirects=True)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=120), follow_redirects=True,
+                               headers={"User-Agent": USER_AGENT, "Referer": "https://www.facebook.com/"})
     upstream = await client.send(client.build_request("GET", cdn_url), stream=True)
     if upstream.status_code != 200:
         await upstream.aclose(); await client.aclose()
         _cache.pop(url, None)  # signed link probably expired
+        log.warning("CDN returned %s for %s", upstream.status_code, url)
         raise HTTPException(502, "Facebook refused the download. Please try again.")
 
     async def body():
