@@ -27,7 +27,22 @@ ALLOWED_CDN_SUFFIX = ".fbcdn.net"
 CACHE_TTL = 15 * 60          # seconds an extracted result stays cached
 RATE_LIMIT = 20              # requests per IP ...
 RATE_WINDOW = 10 * 60        # ... per 10 minutes
-BROWSER_TIMEOUT = 25         # seconds to wait for Facebook's player to load the video
+import os
+# Optional: route Facebook requests through a (residential) proxy, e.g.
+# http://user:pass@host:port — set PROXY_URL in Render → Environment.
+PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
+
+
+def playwright_proxy(url: str) -> dict:
+    p = urlparse(url)
+    out = {"server": f"{p.scheme}://{p.hostname}:{p.port}"}
+    if p.username:
+        out["username"] = p.username
+        out["password"] = p.password or ""
+    return out
+
+
+BROWSER_TIMEOUT = 30        # seconds to wait for Facebook's player to load the video
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
@@ -77,6 +92,8 @@ def is_cdn(u: str) -> bool:
 def _ytdlp_extract(url: str) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
             "http_headers": {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}}
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist" and info.get("entries"):
@@ -122,10 +139,18 @@ async def get_browser():
             from playwright.async_api import async_playwright
             if _pw is None:
                 _pw = await async_playwright().start()
-            _browser = await _pw.chromium.launch(
+            launch_args = dict(
                 headless=True,
                 args=["--disable-dev-shm-usage", "--disable-gpu", "--no-sandbox",
-                      "--disable-extensions", "--mute-audio"])
+                      "--disable-extensions", "--mute-audio",
+                      "--disable-blink-features=AutomationControlled"])
+            if PROXY_URL:
+                launch_args["proxy"] = playwright_proxy(PROXY_URL)
+            try:
+                # Full Chromium in "new headless" mode looks like a normal browser to sites.
+                _browser = await _pw.chromium.launch(channel="chromium", **launch_args)
+            except Exception:
+                _browser = await _pw.chromium.launch(**launch_args)
             log.info("headless browser started")
         return _browser
 
@@ -155,14 +180,23 @@ async def browser_extract(url: str) -> dict:
     browser = await get_browser()
     async with _browser_slots:
         ctx = await browser.new_context(user_agent=USER_AGENT, locale="en-US",
+                                        timezone_id="America/New_York",
                                         viewport={"width": 1280, "height": 800})
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         captured: list[str] = []
+        stats = {"graphql": 0, "video_bytes_blocked": 0}
         try:
             page = await ctx.new_page()
 
-            # Save bandwidth/memory: skip images, fonts and the actual video stream.
+            # Save bandwidth: skip images and fonts, and abort actual video-file downloads
+            # (the player still asks for them, which is what makes it fetch the links).
             async def block(route):
-                if route.request.resource_type in ("image", "media", "font"):
+                req = route.request
+                if req.resource_type in ("image", "font"):
+                    await route.abort()
+                elif req.resource_type == "media" or (is_cdn(req.url) and ".mp4" in req.url):
+                    stats["video_bytes_blocked"] += 1
                     await route.abort()
                 else:
                     await route.continue_()
@@ -171,6 +205,7 @@ async def browser_extract(url: str) -> dict:
             # Facebook's player fetches the video links via /api/graphql/ after load.
             async def on_response(resp):
                 if "/api/graphql" in resp.url:
+                    stats["graphql"] += 1
                     try:
                         body = await resp.text()
                         if "browser_native" in body or "playable_url" in body:
@@ -181,19 +216,36 @@ async def browser_extract(url: str) -> dict:
 
             await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT * 1000)
 
-            found, deadline = {}, time.time() + BROWSER_TIMEOUT
+            found, deadline, nudged = {}, time.time() + BROWSER_TIMEOUT, False
             while time.time() < deadline:
                 html = await page.content()
                 found = parse_player_data(html + "\n".join(captured))
                 if "HD" in found or ("SD" in found and time.time() > deadline - BROWSER_TIMEOUT / 2):
                     break
+                if not nudged and time.time() > deadline - BROWSER_TIMEOUT + 5:
+                    # Close the "log in" pop-up and press play, like a visitor would.
+                    nudged = True
+                    try:
+                        await page.keyboard.press("Escape")
+                        for sel in ('[aria-label="Close"]', 'div[role="dialog"] [aria-label="Close"]'):
+                            if await page.locator(sel).count():
+                                await page.locator(sel).first.click(timeout=2000)
+                        if await page.locator("video").count():
+                            await page.locator("video").first.click(timeout=3000, force=True)
+                        await page.mouse.wheel(0, 400)
+                    except Exception:
+                        pass
                 await asyncio.sleep(1)
 
             if not found:
-                html = await page.content()
-                if 'id="login_form"' in html and "browser_native" not in html:
-                    raise ValueError("browser: login wall")
-                raise ValueError("browser: player never loaded a video link")
+                title = await page.title()
+                final = page.url
+                has_video_tag = await page.locator("video").count()
+                detail = (f"title={title!r} url={final} video_tags={has_video_tag} "
+                          f"graphql={stats['graphql']} video_requests={stats['video_bytes_blocked']}")
+                if "/login" in final or "checkpoint" in final:
+                    raise ValueError("browser: login wall " + detail)
+                raise ValueError("browser: player never loaded a video link " + detail)
 
             meta = await page.evaluate("""() => {
                 const m = p => document.querySelector(`meta[property="${p}"]`)?.content || null;
@@ -300,7 +352,8 @@ async def download(url: str, format_id: str, request: Request):
         raise HTTPException(400, "Unexpected video source.")
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(30, read=120), follow_redirects=True,
-                               headers={"User-Agent": USER_AGENT, "Referer": "https://www.facebook.com/"})
+                               headers={"User-Agent": USER_AGENT, "Referer": "https://www.facebook.com/"},
+                               proxy=PROXY_URL)
     upstream = await client.send(client.build_request("GET", cdn_url), stream=True)
     if upstream.status_code != 200:
         await upstream.aclose(); await client.aclose()
