@@ -1,13 +1,12 @@
-FROM python:3.12-slim
+# Microsoft's official Playwright image: Python + Chromium + all its system libraries preinstalled.
+# Keep this tag in sync with the playwright version pinned in requirements.txt.
+FROM mcr.microsoft.com/playwright/python:v1.65.0-noble
 
 WORKDIR /app
 COPY requirements.txt .
-# 1) App deps + newest yt-dlp nightly (Facebook fixes land there first).
-# 2) Headless Chrome (Playwright's lightweight "headless shell") + its system libraries.
-RUN pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir --upgrade --pre "yt-dlp[default,curl-cffi]" \
- && playwright install --with-deps --only-shell chromium \
- && rm -rf /var/lib/apt/lists/*
+# App deps, then the newest yt-dlp nightly (Facebook fixes land there first).
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
+ && pip install --no-cache-dir --break-system-packages --upgrade --pre "yt-dlp[default]"
 
 COPY . .
 ENV PORT=8000
